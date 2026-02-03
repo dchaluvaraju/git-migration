@@ -13,9 +13,8 @@ CE_URL_ENV = "GITLAB_CE_URL"
 EE_URL_ENV = "GITLAB_EE_URL"
 CE_TOKEN_ENV = "GITLAB_CE_TOKEN"
 EE_TOKEN_ENV = "GITLAB_EE_TOKEN"
-
-INPUT_FILE = "projects.txt"
-DEST_ROOT_GROUP = "root-groupB"
+INPUT_FILE_ENV = "GITLAB_PROJECTS_FILE"
+DEST_ROOT_ENV = "GITLAB_DEST_ROOT_GROUP"
 
 
 def die(message: str) -> None:
@@ -115,13 +114,13 @@ def run_git(args, cwd=None):
         raise RuntimeError(f"git failed: {stderr}")
 
 
-def migrate_repo(ce_url, ce_token, ee_url, ee_token, repo_path_with_git):
+def migrate_repo(ce_url, ce_token, ee_url, ee_token, repo_path_with_git, dest_root_group):
     repo_path = repo_path_with_git[:-4] if repo_path_with_git.endswith(".git") else repo_path_with_git
     parts = [p for p in repo_path.split("/") if p]
     if not parts:
         return
 
-    dest_parts = [DEST_ROOT_GROUP] + parts
+    dest_parts = [dest_root_group] + parts
     project_name = dest_parts[-1]
     group_parts = dest_parts[:-1]
 
@@ -159,7 +158,18 @@ def main():
     ce_token = require_env(CE_TOKEN_ENV)
     ee_token = require_env(EE_TOKEN_ENV)
 
-    input_path = Path(INPUT_FILE)
+    input_file = os.getenv(INPUT_FILE_ENV)
+    if not input_file:
+        die(f"Missing environment variable {INPUT_FILE_ENV}")
+    
+    dest_root_group = os.getenv(DEST_ROOT_ENV)
+    if not dest_root_group:
+        die(f"Missing environment variable {DEST_ROOT_ENV}")
+    dest_root_group = dest_root_group.strip().strip("/")
+    if not dest_root_group:
+        die(f"{DEST_ROOT_ENV} cannot be empty after stripping slashes")
+
+    input_path = Path(input_file)
     if not input_path.exists():
         die(f"Input file not found: {input_path}")
 
@@ -172,11 +182,11 @@ def main():
         repos.append(line)
 
     if not repos:
-        die("No repositories found in projects.txt")
+        die(f"No repositories found in {input_file}")
 
     for repo in repos:
         try:
-            migrate_repo(ce_url, ce_token, ee_url, ee_token, repo)
+            migrate_repo(ce_url, ce_token, ee_url, ee_token, repo, dest_root_group)
         except Exception as exc:
             print(f"Failed to migrate {repo}: {exc}", file=sys.stderr)
 
