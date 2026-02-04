@@ -1,8 +1,9 @@
 # GitLab CE to EE Migration (group remap)
 
-This project migrates GitLab repositories listed in `projects.txt` from a GitLab
+This project migrates GitLab projects listed in `projects.txt` from a GitLab
 Community Edition (CE) instance to a GitLab Enterprise Edition (EE) instance.
-It also remaps the namespace by inserting a new root group.
+It uses GitLab's project export/import API to move repository data and issues,
+and it remaps the namespace by inserting a new root group.
 
 Example:
 `root-group/sub-group/sub-group/project.git` becomes
@@ -10,15 +11,15 @@ Example:
 
 ## How it works
 
-- Reads `projects.txt` from the current folder.
+- Reads `projects.txt` from the current folder (or env var).
 - Creates missing groups and sub-groups in EE.
-- Creates the project in EE if needed.
-- Clones the CE repo as a bare repo and pushes branches and tags to EE.
+- Exports the CE project and imports it into EE.
+- If the EE project already exists, it skips import and verifies issues.
+- Any open CE issues are closed with a comment linking to the EE issue.
 
 ## Requirements
 
 - Python 3
-- `git`
 - Python package: `requests`
 
 ## Setup Instructions
@@ -35,8 +36,10 @@ Make sure `git` is installed and available in your PATH.
 
 Create personal access tokens for both GitLab instances:
 
-- **Source GitLab (CE)**: Token needs `read_api` and `read_repository` scopes
-- **Destination GitLab (EE)**: Token needs `api` scope (to create groups/projects and push code)
+- **Source GitLab (CE)**: Token needs `read_api` scope
+- **Destination GitLab (EE)**: Token needs `api` scope (to create groups/projects and import)
+
+Ensure that **project export** is enabled in the GitLab admin settings on the CE instance.
 
 ### 3. Create Projects List File
 
@@ -99,9 +102,9 @@ The script will:
 1. Read the list of repositories from your projects file
 2. For each repository:
    - Create the destination group hierarchy in EE (if it doesn't exist)
-   - Create the project in EE (if it doesn't exist)
-   - Clone the repository from CE as a bare mirror
-   - Push all branches and tags to EE
+   - Export the project from CE
+   - Import the project into EE at the remapped namespace
+   - Close open CE issues with a comment linking to the EE issue
 
 The script prints whether each group/project already exists or was created,
-then pushes all branches and tags to the EE project.
+then performs export/import and reconciles issues.

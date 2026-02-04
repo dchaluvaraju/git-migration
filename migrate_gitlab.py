@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 import os
 import sys
+import time
 import tempfile
-import subprocess
 from pathlib import Path
-from urllib.parse import quote, urlparse
+from urllib.parse import quote
 
 import requests
 
@@ -15,6 +15,10 @@ CE_TOKEN_ENV = "GITLAB_CE_TOKEN"
 EE_TOKEN_ENV = "GITLAB_EE_TOKEN"
 INPUT_FILE_ENV = "GITLAB_PROJECTS_FILE"
 DEST_ROOT_ENV = "GITLAB_DEST_ROOT_GROUP"
+
+EXPORT_POLL_SECONDS = 5
+IMPORT_POLL_SECONDS = 5
+MAX_POLL_MINUTES = 60
 
 
 def die(message: str) -> None:
@@ -39,9 +43,9 @@ def api_headers(token: str) -> dict:
     return {"PRIVATE-TOKEN": token}
 
 
-def api_get(base_url: str, token: str, path: str):
+def api_get(base_url: str, token: str, path: str, params=None):
     url = f"{base_url}/api/v4/{path}"
-    response = requests.get(url, headers=api_headers(token), timeout=30)
+    response = requests.get(url, headers=api_headers(token), params=params, timeout=60)
     if response.status_code == 200:
         return response.json()
     if response.status_code == 404:
@@ -49,9 +53,45 @@ def api_get(base_url: str, token: str, path: str):
     response.raise_for_status()
 
 
-def api_post(base_url: str, token: str, path: str, payload: dict):
+def api_get_all(base_url: str, token: str, path: str, params=None):
+    items = []
+    page = 1
+    while True:
+        req_params = {"per_page": 100, "page": page}
+        if params:
+            req_params.update(params)
+        payload = api_get(base_url, token, path, params=req_params)
+        if not payload:
+            break
+        if isinstance(payload, dict):
+            items.append(payload)
+            break
+        items.extend(payload)
+        page += 1
+    return items
+
+
+def api_post(base_url: str, token: str, path: str, payload=None):
     url = f"{base_url}/api/v4/{path}"
-    response = requests.post(url, headers=api_headers(token), json=payload, timeout=30)
+    response = requests.post(url, headers=api_headers(token), json=payload, timeout=60)
+    if response.status_code in (200, 201, 202):
+        if response.content:
+            return response.json()
+        return None
+    response.raise_for_status()
+
+
+def api_post_form(base_url: str, token: str, path: str, data=None, files=None):
+    url = f"{base_url}/api/v4/{path}"
+    response = requests.post(url, headers=api_headers(token), data=data, files=files, timeout=300)
+    if response.status_code in (200, 201, 202):
+        return response.json()
+    response.raise_for_status()
+
+
+def api_put(base_url: str, token: str, path: str, payload: dict):
+    url = f"{base_url}/api/v4/{path}"
+    response = requests.put(url, headers=api_headers(token), json=payload, timeout=60)
     if response.status_code in (200, 201):
         return response.json()
     response.raise_for_status()
@@ -71,7 +111,6 @@ def ensure_group(base_url: str, token: str, full_path: str, name: str, parent_id
         created = api_post(base_url, token, "groups", payload)
         return created["id"], True
     except requests.HTTPError as exc:
-        # If created by another run in the meantime, re-fetch.
         response = exc.response
         if response is not None and response.status_code in (400, 409):
             group = api_get(base_url, token, f"groups/{encoded}")
@@ -80,38 +119,149 @@ def ensure_group(base_url: str, token: str, full_path: str, name: str, parent_id
         raise
 
 
-def ensure_project(base_url: str, token: str, full_path: str, name: str, namespace_id: int):
-    encoded = quote(full_path, safe="")
-    project = api_get(base_url, token, f"projects/{encoded}")
-    if project:
-        return project["id"], False
-
-    payload = {"name": name, "path": name, "namespace_id": namespace_id}
-    try:
-        created = api_post(base_url, token, "projects", payload)
-        return created["id"], True
-    except requests.HTTPError as exc:
-        response = exc.response
-        if response is not None and response.status_code in (400, 409):
-            project = api_get(base_url, token, f"projects/{encoded}")
-            if project:
-                return project["id"], False
-        raise
+def get_project(base_url: str, token: str, project_path_or_id: str):
+    encoded = quote(str(project_path_or_id), safe="")
+    return api_get(base_url, token, f"projects/{encoded}")
 
 
-def git_repo_url(base_url: str, token: str, repo_path: str) -> str:
-    parsed = urlparse(base_url)
-    base_path = parsed.path.rstrip("/")
-    if base_path:
-        base_path = base_path + "/"
-    return f"{parsed.scheme}://oauth2:{token}@{parsed.netloc}/{base_path}{repo_path}"
+def wait_for_export(base_url: str, token: str, project_id: int):
+    deadline = time.time() + MAX_POLL_MINUTES * 60
+    while time.time() < deadline:
+        status = api_get(base_url, token, f"projects/{project_id}/export")
+        if not status:
+            time.sleep(EXPORT_POLL_SECONDS)
+            continue
+        export_status = status.get("export_status") or status.get("status")
+        if export_status == "finished":
+            return
+        if export_status in ("failed",):
+            raise RuntimeError(f"Export failed for project {project_id}: {status}")
+        time.sleep(EXPORT_POLL_SECONDS)
+    raise RuntimeError(f"Export timed out for project {project_id}")
 
 
-def run_git(args, cwd=None):
-    result = subprocess.run(args, cwd=cwd, capture_output=True, text=True)
-    if result.returncode != 0:
-        stderr = result.stderr.strip() or "unknown error"
-        raise RuntimeError(f"git failed: {stderr}")
+def download_export(base_url: str, token: str, project_id: int, dest_path: Path):
+    url = f"{base_url}/api/v4/projects/{project_id}/export/download"
+    with requests.get(url, headers=api_headers(token), stream=True, timeout=300) as response:
+        response.raise_for_status()
+        with dest_path.open("wb") as handle:
+            for chunk in response.iter_content(chunk_size=1024 * 1024):
+                if chunk:
+                    handle.write(chunk)
+
+
+def wait_for_import(base_url: str, token: str, project_id: int):
+    deadline = time.time() + MAX_POLL_MINUTES * 60
+    while time.time() < deadline:
+        status = api_get(base_url, token, f"projects/{project_id}/import")
+        if not status:
+            time.sleep(IMPORT_POLL_SECONDS)
+            continue
+        import_status = status.get("import_status") or status.get("status")
+        if import_status == "finished":
+            return
+        if import_status == "failed":
+            raise RuntimeError(f"Import failed for project {project_id}: {status.get('import_error')}")
+        time.sleep(IMPORT_POLL_SECONDS)
+    raise RuntimeError(f"Import timed out for project {project_id}")
+
+
+def build_issue_maps(ee_issues):
+    by_iid = {issue.get("iid"): issue for issue in ee_issues if issue.get("iid")}
+    by_title_created = {}
+    for issue in ee_issues:
+        key = (issue.get("title"), issue.get("created_at"))
+        if key[0] and key[1]:
+            by_title_created[key] = issue
+    return by_iid, by_title_created
+
+
+def ce_has_migration_note(ce_notes, ee_issue_url: str) -> bool:
+    if not ee_issue_url:
+        return False
+    needle = f"Migrated to EE: {ee_issue_url}"
+    for note in ce_notes:
+        if note.get("body", "").strip() == needle:
+            return True
+    return False
+
+
+def close_ce_issue_with_link(ce_url, ce_token, ce_project_id, ce_iid, ee_issue_url):
+    ce_notes = api_get_all(
+        ce_url,
+        ce_token,
+        f"projects/{ce_project_id}/issues/{ce_iid}/notes",
+        params={"order_by": "created_at", "sort": "asc"},
+    )
+    if ee_issue_url and not ce_has_migration_note(ce_notes, ee_issue_url):
+        api_post(
+            ce_url,
+            ce_token,
+            f"projects/{ce_project_id}/issues/{ce_iid}/notes",
+            {"body": f"Migrated to EE: {ee_issue_url}"},
+        )
+    api_put(
+        ce_url,
+        ce_token,
+        f"projects/{ce_project_id}/issues/{ce_iid}",
+        {"state_event": "close"},
+    )
+
+
+def reconcile_issues(ce_url, ce_token, ee_url, ee_token, ce_project, ee_project):
+    ce_project_id = ce_project["id"]
+    ee_project_id = ee_project["id"]
+
+    ce_issues = api_get_all(
+        ce_url,
+        ce_token,
+        f"projects/{ce_project_id}/issues",
+        params={"state": "all", "order_by": "iid", "sort": "asc"},
+    )
+    ee_issues = api_get_all(
+        ee_url,
+        ee_token,
+        f"projects/{ee_project_id}/issues",
+        params={"state": "all", "order_by": "iid", "sort": "asc"},
+    )
+
+    if len(ce_issues) != len(ee_issues):
+        print(
+            f"Warning: issue count mismatch CE={len(ce_issues)} EE={len(ee_issues)} for {ee_project.get('path_with_namespace')}"
+        )
+
+    ee_by_iid, ee_by_title_created = build_issue_maps(ee_issues)
+
+    for ce_issue in ce_issues:
+        ee_issue = ee_by_iid.get(ce_issue.get("iid"))
+        if not ee_issue:
+            key = (ce_issue.get("title"), ce_issue.get("created_at"))
+            ee_issue = ee_by_title_created.get(key)
+        if not ee_issue:
+            print(f"Warning: Could not find EE issue for CE IID {ce_issue.get('iid')}")
+            continue
+
+        if ce_issue.get("state") == "opened":
+            ee_url_link = ee_issue.get("web_url")
+            if ee_url_link:
+                close_ce_issue_with_link(ce_url, ce_token, ce_project_id, ce_issue["iid"], ee_url_link)
+                print(f"Closed CE issue {ce_issue['iid']} with link to EE issue.")
+
+
+def export_project(ce_url, ce_token, ce_project_id: int):
+    api_post(ce_url, ce_token, f"projects/{ce_project_id}/export")
+    wait_for_export(ce_url, ce_token, ce_project_id)
+
+
+def import_project(ee_url, ee_token, export_file: Path, dest_namespace: str, dest_path: str, dest_name: str):
+    with export_file.open("rb") as handle:
+        files = {"file": handle}
+        data = {
+            "path": dest_path,
+            "name": dest_name,
+            "namespace_path": dest_namespace,
+        }
+        return api_post_form(ee_url, ee_token, "projects/import", data=data, files=files)
 
 
 def migrate_repo(ce_url, ce_token, ee_url, ee_token, repo_path_with_git, dest_root_group):
@@ -135,21 +285,46 @@ def migrate_repo(ce_url, ce_token, ee_url, ee_token, repo_path_with_git, dest_ro
             print(f"Group already exists: {current_path}")
 
     dest_full_path = "/".join(dest_parts)
-    _, created = ensure_project(ee_url, ee_token, dest_full_path, project_name, parent_id)
-    if created:
-        print(f"Created project: {dest_full_path}")
+
+    ce_project = get_project(ce_url, ce_token, repo_path)
+    if not ce_project:
+        raise RuntimeError(f"CE project not found: {repo_path}")
+
+    ee_project = get_project(ee_url, ee_token, dest_full_path)
+    if ee_project:
+        print(f"Project already exists in EE: {dest_full_path}")
+        reconcile_issues(ce_url, ce_token, ee_url, ee_token, ce_project, ee_project)
+        return
+
+    print(f"Exporting project from CE: {repo_path}")
+    export_project(ce_url, ce_token, ce_project["id"])
+
+    with tempfile.TemporaryDirectory(prefix="gitlab-export-") as tmpdir:
+        export_file = Path(tmpdir) / f"{project_name}-export.tar.gz"
+        download_export(ce_url, ce_token, ce_project["id"], export_file)
+
+        print(f"Importing project to EE: {dest_full_path}")
+        imported = import_project(
+            ee_url,
+            ee_token,
+            export_file,
+            dest_namespace="/".join(group_parts),
+            dest_path=project_name,
+            dest_name=project_name,
+        )
+
+    ee_project_id = imported.get("id") if imported else None
+    if not ee_project_id:
+        ee_project = get_project(ee_url, ee_token, dest_full_path)
+        if not ee_project:
+            raise RuntimeError(f"Import did not return project info for {dest_full_path}")
+        ee_project_id = ee_project["id"]
     else:
-        print(f"Project already exists: {dest_full_path}")
+        ee_project = get_project(ee_url, ee_token, ee_project_id)
 
-    with tempfile.TemporaryDirectory(prefix="gitlab-migrate-") as tmpdir:
-        mirror_dir = Path(tmpdir) / "repo.git"
-        src_url = git_repo_url(ce_url, ce_token, repo_path_with_git)
-        dst_url = git_repo_url(ee_url, ee_token, dest_full_path + ".git")
-
-        print(f"Migrating {repo_path_with_git} -> {dest_full_path}.git")
-        run_git(["git", "clone", "--bare", src_url, str(mirror_dir)])
-        run_git(["git", "push", "--all", dst_url], cwd=str(mirror_dir))
-        run_git(["git", "push", "--tags", dst_url], cwd=str(mirror_dir))
+    wait_for_import(ee_url, ee_token, ee_project_id)
+    ee_project = get_project(ee_url, ee_token, ee_project_id)
+    reconcile_issues(ce_url, ce_token, ee_url, ee_token, ce_project, ee_project)
 
 
 def main():
@@ -161,7 +336,7 @@ def main():
     input_file = os.getenv(INPUT_FILE_ENV)
     if not input_file:
         die(f"Missing environment variable {INPUT_FILE_ENV}")
-    
+
     dest_root_group = os.getenv(DEST_ROOT_ENV)
     if not dest_root_group:
         die(f"Missing environment variable {DEST_ROOT_ENV}")
