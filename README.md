@@ -64,6 +64,7 @@ Set all **6 required** environment variables:
 | `GITLAB_EE_TOKEN` | Destination GitLab access token | `glpat-yyyyyyyyyyyy` |
 | `GITLAB_PROJECTS_FILE` | Path to projects list file | `./projects.txt` |
 | `GITLAB_DEST_ROOT_GROUP` | Root group name in destination | `migrated-repos` |
+| `GITLAB_INCLUDE_PREFIX` | Prefix for `.gitlab-ci.yml` include paths | `viridien/` |
 
 **Example:**
 
@@ -74,6 +75,7 @@ export GITLAB_CE_TOKEN="glpat-xxxxxxxxxxxx"
 export GITLAB_EE_TOKEN="glpat-yyyyyyyyyyyy"
 export GITLAB_PROJECTS_FILE="./projects.txt"
 export GITLAB_DEST_ROOT_GROUP="migrated-repos"
+export GITLAB_INCLUDE_PREFIX="viridien/"
 ```
 
 ## Usage

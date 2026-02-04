@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
+import base64
 import os
+import re
 import sys
 import time
 import tempfile
@@ -15,6 +17,7 @@ CE_TOKEN_ENV = "GITLAB_CE_TOKEN"
 EE_TOKEN_ENV = "GITLAB_EE_TOKEN"
 INPUT_FILE_ENV = "GITLAB_PROJECTS_FILE"
 DEST_ROOT_ENV = "GITLAB_DEST_ROOT_GROUP"
+INCLUDE_PREFIX_ENV = "GITLAB_INCLUDE_PREFIX"
 
 EXPORT_POLL_SECONDS = 5
 IMPORT_POLL_SECONDS = 5
@@ -97,6 +100,14 @@ def api_put(base_url: str, token: str, path: str, payload: dict):
     response.raise_for_status()
 
 
+def api_put_form(base_url: str, token: str, path: str, data=None):
+    url = f"{base_url}/api/v4/{path}"
+    response = requests.put(url, headers=api_headers(token), data=data, timeout=60)
+    if response.status_code in (200, 201):
+        return response.json()
+    response.raise_for_status()
+
+
 def ensure_group(base_url: str, token: str, full_path: str, name: str, parent_id=None):
     encoded = quote(full_path, safe="")
     group = api_get(base_url, token, f"groups/{encoded}")
@@ -174,6 +185,84 @@ def build_issue_maps(ee_issues):
         if key[0] and key[1]:
             by_title_created[key] = issue
     return by_iid, by_title_created
+
+
+def get_file(base_url: str, token: str, project_id: int, file_path: str, ref: str):
+    encoded_path = quote(file_path, safe="")
+    return api_get(
+        base_url,
+        token,
+        f"projects/{project_id}/repository/files/{encoded_path}",
+        params={"ref": ref},
+    )
+
+
+def update_file(base_url: str, token: str, project_id: int, file_path: str, branch: str, content: str):
+    encoded_path = quote(file_path, safe="")
+    payload = {
+        "branch": branch,
+        "content": content,
+        "commit_message": f"Update {file_path} include paths",
+    }
+    return api_put_form(base_url, token, f"projects/{project_id}/repository/files/{encoded_path}", payload)
+
+
+def prefix_infra_includes(ci_text: str, prefix: str) -> str:
+    if "include" not in ci_text or "infra/" not in ci_text:
+        return ci_text
+
+    def replace_infra(line: str) -> str:
+        if "infra/" not in line:
+            return line
+        return re.sub(r"(?<!viridien/)infra/", f"{prefix}infra/", line)
+
+    lines = ci_text.splitlines()
+    out = []
+    in_include = False
+    include_indent = None
+
+    for line in lines:
+        stripped = line.lstrip()
+        indent = len(line) - len(stripped)
+
+        if stripped.startswith("include:"):
+            in_include = True
+            include_indent = indent
+            line = replace_infra(line)
+        else:
+            if in_include:
+                if stripped and indent <= include_indent:
+                    in_include = False
+                else:
+                    line = replace_infra(line)
+        out.append(line)
+
+    result = "\n".join(out)
+    if ci_text.endswith("\n"):
+        result += "\n"
+    return result
+
+
+def update_ci_includes(ee_url, ee_token, ee_project, include_prefix: str):
+    project_id = ee_project["id"]
+    default_branch = ee_project.get("default_branch") or "main"
+    file_info = get_file(ee_url, ee_token, project_id, ".gitlab-ci.yml", default_branch)
+    if not file_info:
+        return
+
+    content_b64 = file_info.get("content") or ""
+    try:
+        ci_text = base64.b64decode(content_b64).decode("utf-8")
+    except Exception:
+        raise RuntimeError("Failed to decode .gitlab-ci.yml content")
+
+    updated = prefix_infra_includes(ci_text, prefix=include_prefix)
+    if updated == ci_text:
+        print("No .gitlab-ci.yml include updates needed.")
+        return
+
+    update_file(ee_url, ee_token, project_id, ".gitlab-ci.yml", default_branch, updated)
+    print("Updated .gitlab-ci.yml include paths.")
 
 
 def ce_has_migration_note(ce_notes, ee_issue_url: str) -> bool:
@@ -264,7 +353,7 @@ def import_project(ee_url, ee_token, export_file: Path, dest_namespace: str, des
         return api_post_form(ee_url, ee_token, "projects/import", data=data, files=files)
 
 
-def migrate_repo(ce_url, ce_token, ee_url, ee_token, repo_path_with_git, dest_root_group):
+def migrate_repo(ce_url, ce_token, ee_url, ee_token, repo_path_with_git, dest_root_group, include_prefix):
     repo_path = repo_path_with_git[:-4] if repo_path_with_git.endswith(".git") else repo_path_with_git
     parts = [p for p in repo_path.split("/") if p]
     if not parts:
@@ -293,6 +382,7 @@ def migrate_repo(ce_url, ce_token, ee_url, ee_token, repo_path_with_git, dest_ro
     ee_project = get_project(ee_url, ee_token, dest_full_path)
     if ee_project:
         print(f"Project already exists in EE: {dest_full_path}")
+        update_ci_includes(ee_url, ee_token, ee_project, include_prefix)
         reconcile_issues(ce_url, ce_token, ee_url, ee_token, ce_project, ee_project)
         return
 
@@ -324,6 +414,7 @@ def migrate_repo(ce_url, ce_token, ee_url, ee_token, repo_path_with_git, dest_ro
 
     wait_for_import(ee_url, ee_token, ee_project_id)
     ee_project = get_project(ee_url, ee_token, ee_project_id)
+    update_ci_includes(ee_url, ee_token, ee_project, include_prefix)
     reconcile_issues(ce_url, ce_token, ee_url, ee_token, ce_project, ee_project)
 
 
@@ -344,6 +435,12 @@ def main():
     if not dest_root_group:
         die(f"{DEST_ROOT_ENV} cannot be empty after stripping slashes")
 
+    include_prefix = os.getenv(INCLUDE_PREFIX_ENV, "").strip()
+    if include_prefix and not include_prefix.endswith("/"):
+        include_prefix = include_prefix + "/"
+    if not include_prefix:
+        include_prefix = "viridien/"
+
     input_path = Path(input_file)
     if not input_path.exists():
         die(f"Input file not found: {input_path}")
@@ -361,7 +458,7 @@ def main():
 
     for repo in repos:
         try:
-            migrate_repo(ce_url, ce_token, ee_url, ee_token, repo, dest_root_group)
+            migrate_repo(ce_url, ce_token, ee_url, ee_token, repo, dest_root_group, include_prefix)
         except Exception as exc:
             print(f"Failed to migrate {repo}: {exc}", file=sys.stderr)
 
